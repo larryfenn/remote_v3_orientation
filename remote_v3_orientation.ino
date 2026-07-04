@@ -70,13 +70,14 @@ unsigned long combo_hold_start = 0;
 // both sides must be pinned to the same one explicitly.
 const uint8_t WIFI_CHANNEL = 1;
 
-// Identifies this device's kind to the receiver (orientation remote = 3).
-static const uint8_t DEVICE_TYPE = 3;
+// Identifies this device's kind to the receiver (orientation remote v3 [2026] = 6).
+static const uint8_t DEVICE_TYPE = 6;
 
 typedef struct __attribute__((packed)) {
   uint8_t id;
   uint32_t time;
   uint8_t device_type;
+  uint8_t seq;
   int16_t w;
   int16_t x;
   int16_t y;
@@ -85,6 +86,7 @@ typedef struct __attribute__((packed)) {
 } orientation_packet_t;
 
 uint8_t id;
+uint8_t packet_seq = 0;  // increments on every packet sent; wraps at 255
 uint8_t action_flag = 0;
 int action_flag_repeats = 0;
 
@@ -318,6 +320,7 @@ void loop(void) {
     packet.id = id;
     packet.time = millis();
     packet.device_type = DEVICE_TYPE;
+    packet.seq = packet_seq++;
     packet.w = w;
     packet.x = x;
     packet.y = y;
