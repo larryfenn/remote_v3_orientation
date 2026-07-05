@@ -46,8 +46,7 @@ const int DATAGRAM_REPEATS = 10;
 
 // ---- Button handling ----
 // Buttons are wired with internal pull-ups: LOW = pressed, HIGH = released.
-const unsigned long BUTTON_DEBOUNCE_MS = 30;     // ignore edges faster than this (mechanical bounce)
-const unsigned long CALIBRATION_HOLD_MS = 1250;  // both buttons held this long triggers calibration
+const unsigned long BUTTON_DEBOUNCE_MS = 30;  // ignore edges faster than this (mechanical bounce)
 
 struct Button {
   int pin;
@@ -61,9 +60,6 @@ Button button_2 = { PIN_BOOT_BTN, false, false, 0 };
 
 bool button_1_was_pressed = false;  // debounced state on the previous update (for edge detection)
 bool button_2_was_pressed = false;
-bool combo_engaged = false;  // both buttons were down together at some point this gesture
-bool combo_fired = false;    // calibration already fired; wait for full release before re-arming
-unsigned long combo_hold_start = 0;
 
 // Neither this device nor the receiver joins a WiFi AP (there's no wireless
 // network in this environment), so nothing else fixes the channel for us --
@@ -89,6 +85,11 @@ uint8_t id;
 uint8_t packet_seq = 0;  // increments on every packet sent; wraps at 255
 uint8_t action_flag = 0;
 int action_flag_repeats = 0;
+
+// Track the transmit switch so we can fire calibration on the off->on edge.
+// Starts LOW (on) so booting -- in any switch position -- never fires calibration;
+// only a real off->on flip during operation does.
+int prev_transmit_switch_state = LOW;
 
 bool led_state = false;
 unsigned long last_led_toggle_time = 0;
@@ -211,12 +212,10 @@ bool readButton(Button& b) {
 }
 
 // Translate button activity into action_flag:
-//   1 = button 1 clicked (pressed and released on its own)
+//   1 = button 1 clicked
 //   2 = button 2 clicked
-//   4 = both buttons held together for CALIBRATION_HOLD_MS (calibration)
-// Single clicks are emitted on *release* so the start of a two-button hold
-// never looks like a stray single click. Calibration fires once per hold and
-// re-arms only after both buttons are fully released.
+// Single clicks are emitted on *press*. (Calibration, flag 4, is no longer a
+// button gesture -- it fires when the transmit switch is toggled on; see loop.)
 void updateButtons() {
   bool b1 = readButton(button_1);
   bool b2 = readButton(button_2);
@@ -224,34 +223,13 @@ void updateButtons() {
   // Only assign a new action while none is in flight: an in-flight flag is
   // repeated across several packets and must not be clobbered mid-send.
   if (action_flag == 0) {
-    if (b1 && b2) {
-      combo_engaged = true;
-      if (combo_hold_start == 0) {
-        combo_hold_start = millis();
-      }
-      if (!combo_fired && millis() - combo_hold_start >= CALIBRATION_HOLD_MS) {
-        action_flag = 4;
-        combo_fired = true;
-      }
-    } else {
-      combo_hold_start = 0;
-    }
-
-    // Falling edge (released): emit the single-button click, unless this
-    // button was part of a two-button gesture.
-    if (button_1_was_pressed && !b1 && !combo_engaged) {
+    // Rising edge (pressed): emit the single-button click.
+    if (!button_1_was_pressed && b1) {
       action_flag = 1;
     }
-    if (button_2_was_pressed && !b2 && !combo_engaged) {
+    if (!button_2_was_pressed && b2) {
       action_flag = 2;
     }
-  }
-
-  // Both buttons up: the gesture is over, re-arm everything.
-  if (!b1 && !b2) {
-    combo_engaged = false;
-    combo_fired = false;
-    combo_hold_start = 0;
   }
 
   button_1_was_pressed = b1;
@@ -278,15 +256,23 @@ void loop(void) {
   // HIGH means it's in the "off" position, LOW means it's in the "on" position
   int transmit_switch_state = digitalRead(PIN_SWITCH);
 
+  // Toggling the transmit switch on (HIGH->LOW edge) triggers calibration.
+  // Set it here so it takes priority over any button press this cycle.
+  if (transmit_switch_state == LOW && prev_transmit_switch_state == HIGH) {
+    action_flag = 4;
+    action_flag_repeats = 0;
+  }
+  prev_transmit_switch_state = transmit_switch_state;
+
   if (transmit_switch_state == HIGH) {
     // Transmit switch is toggled off -- skip sending packets and keep the LED dark.
     digitalWrite(PIN_LED, LOW);
     led_state = false;
   } else {
-    // Actions (see updateButtons):
-    // 1: Button 1 clicked
-    // 2: Button 2 clicked
-    // 4: press and hold buttons 1 and 2 for a bit (triggers calibration)
+    // Actions:
+    // 1: Button 1 clicked (see updateButtons)
+    // 2: Button 2 clicked (see updateButtons)
+    // 4: transmit switch toggled on (calibration; set on the switch edge above)
     // Once the action flag is set it holds that value until it has been sent in
     // a series of packets, since we can't guarantee any single packet arrives.
     updateButtons();
