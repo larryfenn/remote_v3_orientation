@@ -1,3 +1,8 @@
+// bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 2500); sets 400 Hz polling,
+// downgrade to bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 5000); if noticeable wireless
+// or battery life issues
+// static const uint8_t receiver_mac[] defines the MAC of the receiver dongle
+
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -36,17 +41,21 @@ static const int PIN_BNO_CS = 8;    // IO8  -> BNO_CS
 static const int PIN_BNO_INT = 7;   // IO7  -> BNO_INT
 static const int PIN_BNO_RST = 0;   // IO0  -> NRESET_BNO
 
-// Broadcast is fine for our use case here
-static const uint8_t receiver_mac[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+// Unicast to the receiver rather than broadcast: unicast frames get MAC-level
+// ACK and automatic retransmission, so a frame lost to a collision is retried
+// instead of silently dropped. Must match the receiver's MAC.
+static const uint8_t receiver_mac[] = { 0x64, 0xE8, 0x33, 0x86, 0xD6, 0xDC };
 
 Adafruit_BNO08x bno08x(PIN_BNO_RST);
 sh2_SensorValue_t sensorValue;
 
 const int DATAGRAM_REPEATS = 10;
+const int ACTION_DATAGRAMS = DATAGRAM_REPEATS + 1;  // original transmission plus repeats
 
 // ---- Button handling ----
 // Buttons are wired with internal pull-ups: LOW = pressed, HIGH = released.
 const unsigned long BUTTON_DEBOUNCE_MS = 30;  // ignore edges faster than this (mechanical bounce)
+const unsigned long SWITCH_DEBOUNCE_MS = 30;
 
 struct Button {
   int pin;
@@ -84,12 +93,35 @@ typedef struct __attribute__((packed)) {
 uint8_t id;
 uint8_t packet_seq = 0;  // increments on every packet sent; wraps at 255
 uint8_t action_flag = 0;
-int action_flag_repeats = 0;
+uint32_t action_generation = 0;
+int action_flag_successful_sends = 0;
 
 // Track the transmit switch so we can fire calibration on the off->on edge.
-// Starts LOW (on) so booting -- in any switch position -- never fires calibration;
-// only a real off->on flip during operation does.
+// setup() initializes these from the physical switch so booting in either
+// position never fires calibration; only a debounced off->on transition does.
+int transmit_switch_state = LOW;
+int raw_transmit_switch_state = LOW;
 int prev_transmit_switch_state = LOW;
+unsigned long transmit_switch_last_change_ms = 0;
+
+// Report activation can fail transiently, especially after a sensor reset.
+// Retry without blocking loop() so the transmit switch continues to be sampled.
+bool orientation_report_enabled = false;
+unsigned long orientation_report_retry_start_ms = 0;
+unsigned long orientation_report_last_attempt_ms = 0;
+unsigned long orientation_report_last_error_ms = 0;
+const unsigned long REPORT_ENABLE_RETRY_MS = 100;
+
+#if TRANSMIT_MODE == TRANSMIT_ESPNOW
+// ESP-NOW send completion runs on the WiFi task. Keep only one packet in flight
+// so callback results cannot be associated with the wrong action packet.
+portMUX_TYPE esp_now_send_mux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool esp_now_send_in_flight = false;
+volatile bool esp_now_send_result_ready = false;
+volatile bool esp_now_last_send_succeeded = false;
+uint8_t esp_now_in_flight_action_flag = 0;
+uint32_t esp_now_in_flight_action_generation = 0;
+#endif
 
 bool led_state = false;
 unsigned long last_led_toggle_time = 0;
@@ -123,6 +155,104 @@ void haltWithError() {
   }
 }
 
+bool enableOrientationReport() {
+  return bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 2500);
+}
+
+// Called from loop() after a BNO085 reset. Unlike setup-time recovery, this is
+// non-blocking so switch transitions are still observed while the report is
+// being restored.
+bool serviceOrientationReportRecovery() {
+  if (orientation_report_enabled) {
+    return true;
+  }
+
+  unsigned long now = millis();
+  if (orientation_report_last_attempt_ms != 0 &&
+      now - orientation_report_last_attempt_ms < REPORT_ENABLE_RETRY_MS) {
+    return false;
+  }
+
+  orientation_report_last_attempt_ms = now;
+  if (enableOrientationReport()) {
+    orientation_report_enabled = true;
+    Serial.println("Orientation report enabled");
+    return true;
+  }
+
+  if (now - orientation_report_retry_start_ms >= SETUP_ERROR_TIMEOUT_MS &&
+      (orientation_report_last_error_ms == 0 ||
+       now - orientation_report_last_error_ms >= SETUP_ERROR_TIMEOUT_MS)) {
+    Serial.println("Failed to enable orientation report; retrying");
+    orientation_report_last_error_ms = now;
+  }
+  return false;
+}
+
+int readTransmitSwitch() {
+  int raw_state = digitalRead(PIN_SWITCH);
+  if (raw_state != raw_transmit_switch_state) {
+    raw_transmit_switch_state = raw_state;
+    transmit_switch_last_change_ms = millis();
+  }
+  if (millis() - transmit_switch_last_change_ms >= SWITCH_DEBOUNCE_MS) {
+    transmit_switch_state = raw_transmit_switch_state;
+  }
+  return transmit_switch_state;
+}
+
+void beginAction(uint8_t new_action_flag) {
+  action_flag = new_action_flag;
+  action_generation++;
+  action_flag_successful_sends = 0;
+}
+
+void recordSuccessfulActionSend(uint8_t sent_action_flag, uint32_t sent_action_generation) {
+  // A higher-priority action may have replaced the one that was in flight.
+  if (sent_action_flag == 0 || sent_action_flag != action_flag ||
+      sent_action_generation != action_generation) {
+    return;
+  }
+
+  action_flag_successful_sends++;
+  if (action_flag_successful_sends >= ACTION_DATAGRAMS) {
+    action_flag = 0;
+    action_flag_successful_sends = 0;
+  }
+}
+
+#if TRANSMIT_MODE == TRANSMIT_ESPNOW
+void onPacketSent(const esp_now_send_info_t* tx_info, esp_now_send_status_t status) {
+  (void)tx_info;
+  portENTER_CRITICAL(&esp_now_send_mux);
+  esp_now_last_send_succeeded = (status == ESP_NOW_SEND_SUCCESS);
+  esp_now_send_result_ready = true;
+  esp_now_send_in_flight = false;
+  portEXIT_CRITICAL(&esp_now_send_mux);
+}
+
+void processEspNowSendResult() {
+  bool result_ready;
+  bool succeeded = false;
+  uint8_t sent_action_flag = 0;
+  uint32_t sent_action_generation = 0;
+
+  portENTER_CRITICAL(&esp_now_send_mux);
+  result_ready = esp_now_send_result_ready;
+  if (result_ready) {
+    succeeded = esp_now_last_send_succeeded;
+    sent_action_flag = esp_now_in_flight_action_flag;
+    sent_action_generation = esp_now_in_flight_action_generation;
+    esp_now_send_result_ready = false;
+  }
+  portEXIT_CRITICAL(&esp_now_send_mux);
+
+  if (result_ready && succeeded) {
+    recordSuccessfulActionSend(sent_action_flag, sent_action_generation);
+  }
+}
+#endif
+
 void setup(void) {
   Serial.begin(115200);
 
@@ -132,6 +262,11 @@ void setup(void) {
   pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
   pinMode(PIN_SWITCH, INPUT_PULLUP);
   pinMode(PIN_LED, OUTPUT);
+
+  raw_transmit_switch_state = digitalRead(PIN_SWITCH);
+  transmit_switch_state = raw_transmit_switch_state;
+  prev_transmit_switch_state = transmit_switch_state;
+  transmit_switch_last_change_ms = millis();
 
   SPI.begin(PIN_BNO_SCK, PIN_BNO_MISO, PIN_BNO_MOSI, PIN_BNO_CS);
   unsigned long sensor_start = millis();
@@ -144,7 +279,15 @@ void setup(void) {
   }
   // We use SH2_ARVR_STABILIZED_RV because we want full fusion and this is an outdoors application
   // so magnetic interference should be low (i think)
-  bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 2500);
+  unsigned long report_start = millis();
+  while (!enableOrientationReport()) {
+    if (millis() - report_start >= SETUP_ERROR_TIMEOUT_MS) {
+      blinkErrorCode(2);  // sensor responds, but the orientation report could not be enabled
+    } else {
+      delay(10);
+    }
+  }
+  orientation_report_enabled = true;
 
   WiFi.mode(WIFI_STA);
   uint8_t own_mac[6];
@@ -159,6 +302,11 @@ void setup(void) {
     haltWithError();
   }
 
+  if (esp_now_register_send_cb(onPacketSent) != ESP_OK) {
+    Serial.println("Failed to register ESP-NOW send callback");
+    haltWithError();
+  }
+
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, receiver_mac, 6);
   peerInfo.channel = 0;
@@ -168,6 +316,21 @@ void setup(void) {
     haltWithError();
   }
   Serial.println("ESP-NOW peer added");
+
+  // ESP-NOW otherwise transmits at 1 Mbps 802.11b, where our frames each burn
+  // ~750 us of airtime and four remotes at 200 Hz saturate the channel. MCS0
+  // (BPSK, 6.5/7.2 Mbps) cuts that to ~115 us while keeping the most
+  // noise-tolerant modulation, i.e. the longest range. If channel occupancy
+  // ever becomes the constraint again (more remotes / higher rates), switch to
+  // phymode WIFI_PHY_MODE_11G with rate WIFI_PHY_RATE_24M: ~45 us per frame,
+  // at the cost of ~5-7 dB of link margin (range).
+  esp_now_rate_config_t rate_config = {};
+  rate_config.phymode = WIFI_PHY_MODE_HT20;
+  rate_config.rate = WIFI_PHY_RATE_MCS0_SGI;
+  if (esp_now_set_peer_rate_config(receiver_mac, &rate_config) != ESP_OK) {
+    // Not fatal: the link still works at the default 1 Mbps rate.
+    Serial.println("Failed to set ESP-NOW PHY rate");
+  }
 #else
   Serial.println("Connecting to WiFi");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -188,13 +351,38 @@ void setup(void) {
   Serial.println("Setup completed");
 }
 
-void sendPacket(const orientation_packet_t& packet) {
+bool sendPacket(const orientation_packet_t& packet) {
 #if TRANSMIT_MODE == TRANSMIT_ESPNOW
-  esp_now_send(receiver_mac, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+  bool can_send = false;
+  portENTER_CRITICAL(&esp_now_send_mux);
+  if (!esp_now_send_in_flight && !esp_now_send_result_ready) {
+    esp_now_send_in_flight = true;
+    esp_now_in_flight_action_flag = packet.action_flag;
+    esp_now_in_flight_action_generation = action_generation;
+    can_send = true;
+  }
+  portEXIT_CRITICAL(&esp_now_send_mux);
+
+  if (!can_send) {
+    return false;
+  }
+
+  esp_err_t result =
+    esp_now_send(receiver_mac, reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+  if (result != ESP_OK) {
+    portENTER_CRITICAL(&esp_now_send_mux);
+    esp_now_send_in_flight = false;
+    portEXIT_CRITICAL(&esp_now_send_mux);
+    return false;
+  }
+  return true;
 #else
-  udp.beginPacket(UDP_SERVER_IP, UDP_SERVER_PORT);
-  udp.write(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
-  udp.endPacket();
+  if (!udp.beginPacket(UDP_SERVER_IP, UDP_SERVER_PORT)) {
+    return false;
+  }
+  size_t bytes_written = udp.write(reinterpret_cast<const uint8_t*>(&packet), sizeof(packet));
+  bool packet_sent = (udp.endPacket() == 1);
+  return bytes_written == sizeof(packet) && packet_sent;
 #endif
 }
 
@@ -225,10 +413,10 @@ void updateButtons() {
   if (action_flag == 0) {
     // Rising edge (pressed): emit the single-button click.
     if (!button_1_was_pressed && b1) {
-      action_flag = 1;
+      beginAction(1);
     }
     if (!button_2_was_pressed && b2) {
-      action_flag = 2;
+      beginAction(2);
     }
   }
 
@@ -237,9 +425,35 @@ void updateButtons() {
 }
 
 void loop(void) {
+#if TRANSMIT_MODE == TRANSMIT_ESPNOW
+  processEspNowSendResult();
+#endif
+
+  // Poll and debounce the switch independently of sensor events so an IMU
+  // outage cannot hide an off->on calibration transition.
+  int current_transmit_switch_state = readTransmitSwitch();
+  if (current_transmit_switch_state == LOW && prev_transmit_switch_state == HIGH) {
+    beginAction(4);
+  }
+  prev_transmit_switch_state = current_transmit_switch_state;
+
+  if (current_transmit_switch_state == HIGH) {
+    digitalWrite(PIN_LED, LOW);
+    led_state = false;
+  }
+
   if (bno08x.wasReset()) {
     Serial.println("sensor was reset ");
-    bno08x.enableReport(SH2_ARVR_STABILIZED_RV, 2500);
+    orientation_report_enabled = false;
+    orientation_report_retry_start_ms = millis();
+    orientation_report_last_attempt_ms = 0;
+    orientation_report_last_error_ms = 0;
+    digitalWrite(PIN_LED, LOW);
+    led_state = false;
+  }
+
+  if (!serviceOrientationReportRecovery()) {
+    return;
   }
 
   if (!bno08x.getSensorEvent(&sensorValue)) {
@@ -253,22 +467,7 @@ void loop(void) {
     return;
   }
 
-  // HIGH means it's in the "off" position, LOW means it's in the "on" position
-  int transmit_switch_state = digitalRead(PIN_SWITCH);
-
-  // Toggling the transmit switch on (HIGH->LOW edge) triggers calibration.
-  // Set it here so it takes priority over any button press this cycle.
-  if (transmit_switch_state == LOW && prev_transmit_switch_state == HIGH) {
-    action_flag = 4;
-    action_flag_repeats = 0;
-  }
-  prev_transmit_switch_state = transmit_switch_state;
-
-  if (transmit_switch_state == HIGH) {
-    // Transmit switch is toggled off -- skip sending packets and keep the LED dark.
-    digitalWrite(PIN_LED, LOW);
-    led_state = false;
-  } else {
+  if (current_transmit_switch_state == LOW) {
     // Actions:
     // 1: Button 1 clicked (see updateButtons)
     // 2: Button 2 clicked (see updateButtons)
@@ -306,18 +505,19 @@ void loop(void) {
     packet.id = id;
     packet.time = millis();
     packet.device_type = DEVICE_TYPE;
-    packet.seq = packet_seq++;
+    packet.seq = packet_seq;
     packet.w = w;
     packet.x = x;
     packet.y = y;
     packet.z = z;
     packet.action_flag = action_flag;
-    sendPacket(packet);
-    if (action_flag != 0 && action_flag_repeats > DATAGRAM_REPEATS) {
-      action_flag = 0;
-      action_flag_repeats = 0;
-    } else if (action_flag != 0) {
-      action_flag_repeats++;
+    if (sendPacket(packet)) {
+      packet_seq++;
+#if TRANSMIT_MODE == TRANSMIT_UDP
+      // UDP has no asynchronous MAC-level send callback; endPacket() success is
+      // the strongest local confirmation available in this transport mode.
+      recordSuccessfulActionSend(packet.action_flag, action_generation);
+#endif
     }
   }
 }
